@@ -160,17 +160,35 @@ def compute_text_stats(text: str) -> Dict[str, float]:
             - sentence_count: Total number of sentences
             - unique_word_count: Number of unique words
             - unique_word_ratio: Ratio of unique words to total words (0-1)
+            - avg_word_length: Average number of characters per word
+            - avg_sentence_length: Average number of words per sentence
     """
     word_count = count_words(text)
     sentence_count = count_sentences(text)
     unique_word_count = count_unique_words(text)
     unique_word_ratio = get_unique_word_ratio(text)
 
+    words = re.findall(r"\w+", text)
+
+    avg_word_length = (
+        sum(len(word) for word in words) / word_count
+        if word_count > 0
+        else 0.0
+    )
+
+    avg_sentence_length = (
+        word_count / sentence_count
+        if sentence_count > 0
+        else 0.0
+    )
+
     return {
         "word_count": word_count,
         "sentence_count": sentence_count,
         "unique_word_count": unique_word_count,
         "unique_word_ratio": unique_word_ratio,
+        "avg_word_length": avg_word_length,
+        "avg_sentence_length": avg_sentence_length,
     }
 
 
