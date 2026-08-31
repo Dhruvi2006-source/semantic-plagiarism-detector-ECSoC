@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
+import html
+import json
+import re
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 import pandas as pd
@@ -9,6 +13,7 @@ import streamlit as st
 
 from app.theme import badge_html, tier_from_severity_label
 from src.core.config import normalize_severity_label, severity_from_score, severity_rank
+from src.core.stopwords import get_stopwords
 from src.db.incidents import _normalise_pair, add_false_positive, get_false_positives
 from src.i18n.translator import get_text
 from src.utils.pagination import PaginationPage, paginate_items
@@ -20,8 +25,18 @@ except ImportError:
         from fuzzywuzzy import fuzz  # type: ignore[import-untyped,reportMissingImports]
     except ImportError:
         fuzz = None
+
+
 FUZZY_THRESHOLD = 75
 MAX_SEARCH_QUERY_LENGTH = 200
+WARNING_SHORT_DOCUMENT = (
+    "Document contains fewer than 50 words; similarity scoring may be unreliable."
+)
+WARNING_BINARY_CHARACTERS = (
+    "Document contains an unusually high ratio of non-printable control "
+    "characters; the file may be binary or corrupted rather than text."
+)
+CONTROL_CHARACTER_RATIO_THRESHOLD = 0.01
 
 _SORT_KEYS = {
     "warn_sort_similarity": "similarity",
@@ -38,6 +53,145 @@ def _sort_display_names(lang_code: str) -> dict[str, str]:
 WarningPage = PaginationPage[dict[str, Any]]
 
 
+@dataclass
+class DocumentWarning:
+    """Represents a document-level plagiarism or processing warning."""
+
+    doc_a: str = ""
+    doc_b: str = ""
+    similarity: float = 0.0
+    severity: str = "Low"
+    message: str = ""
+    warning_type: str = ""
+    details: dict[str, Any] = field(default_factory=dict)
+    occurrence_count: int = 1
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "doc_a": self.doc_a,
+            "doc_b": self.doc_b,
+            "similarity": self.similarity,
+            "severity": self.severity,
+            "message": self.message,
+            "warning_type": self.warning_type,
+            "occurrence_count": self.occurrence_count,
+            **self.details,
+        }
+
+
+class WarningList:
+    """Collection manager for document warnings supporting filtering by severity."""
+
+    def __init__(
+        self,
+        warnings: Iterable[DocumentWarning | Mapping[str, Any]] | None = None,
+    ) -> None:
+        self.warnings: list[DocumentWarning] = []
+        if warnings:
+            for item in warnings:
+                self.add_warning(item)
+
+    def add_warning(self, item: DocumentWarning | Mapping[str, Any]) -> None:
+        if isinstance(item, DocumentWarning):
+            dw = item
+        elif isinstance(item, Mapping):
+            dw = DocumentWarning(
+                doc_a=str(item.get("doc_a", "")),
+                doc_b=str(item.get("doc_b", "")),
+                similarity=float(item.get("similarity", 0.0)),
+                severity=str(item.get("severity", "Low")),
+                message=str(item.get("message", "")),
+                warning_type=str(item.get("warning_type", "")),
+                details=dict(item),
+            )
+        else:
+            return
+
+        # Same (filename, code) pair already recorded — bump its count
+        # instead of adding a duplicate row to the UI warning panel.
+        for existing in self.warnings:
+            if existing.doc_a == dw.doc_a and existing.warning_type == dw.warning_type:
+                existing.occurrence_count += 1
+                return
+
+        self.warnings.append(dw)
+
+    def filter_by_severity(self, severity: str) -> list[DocumentWarning]:
+        """Filter warnings by severity level (e.g. 'High', 'Medium', 'Low')."""
+        target = str(severity or "").strip().casefold()
+        return [
+            w
+            for w in self.warnings
+            if w.severity.strip().casefold() == target
+        ]
+
+    def __len__(self) -> int:
+        return len(self.warnings)
+
+    def __iter__(self):
+        return iter(self.warnings)
+
+    def __getitem__(self, index: int) -> DocumentWarning:
+        return self.warnings[index]
+
+
+def filter_by_severity(
+    warnings_or_severity: Iterable[DocumentWarning | Mapping[str, Any]] | str,
+    severity: str | None = None,
+) -> list[DocumentWarning]:
+    """Filter warnings by severity level (e.g. 'High', 'Medium', 'Low').
+
+    Can be called as:
+      - filter_by_severity(warnings, "High")
+      - filter_by_severity("High", warnings)
+      - filter_by_severity("High")
+    """
+    if isinstance(warnings_or_severity, str):
+        target_severity = warnings_or_severity
+        items = severity if severity is not None else []
+    else:
+        items = warnings_or_severity
+        target_severity = severity or ""
+
+    if isinstance(items, WarningList):
+        return items.filter_by_severity(target_severity)
+
+    wl = WarningList(items if isinstance(items, Iterable) else [])
+    return wl.filter_by_severity(target_severity)
+
+
+def _warning_to_export_record(
+    item: DocumentWarning | Mapping[str, Any],
+) -> dict[str, str]:
+    """Flatten a warning into the Filename/Warning Code/Severity/Message row used for export."""
+    data = item.to_dict() if isinstance(item, DocumentWarning) else dict(item)
+    return {
+        "Filename": str(data.get("doc_a", "")),
+        "Warning Code": str(data.get("warning_type", "")),
+        "Severity": str(data.get("severity", "")),
+        "Message": str(data.get("message", "")),
+    }
+
+
+def export_warnings_to_csv(
+    warnings: Iterable[DocumentWarning | Mapping[str, Any]],
+) -> str:
+    """Export warnings to a CSV string with Filename, Warning Code, Severity, Message columns."""
+    records = [_warning_to_export_record(item) for item in warnings]
+    df = pd.DataFrame(
+        records, columns=["Filename", "Warning Code", "Severity", "Message"]
+    )
+    return df.to_csv(index=False)
+
+
+def export_warnings_to_json(
+    warnings: Iterable[DocumentWarning | Mapping[str, Any]],
+) -> str:
+    """Export warnings to a JSON string with Filename, Warning Code, Severity, Message keys."""
+    records = [_warning_to_export_record(item) for item in warnings]
+    return json.dumps(records, indent=2)
+
+
 def _normalise_warning(
     warning: Mapping[str, Any],
 ) -> dict[str, Any]:
@@ -52,20 +206,90 @@ def _normalise_warning(
     except ValueError:
         severity = severity_from_score(similarity)
 
-    return {
+    # Compute document-level stop-word percentages using chunked docs
+    def _doc_stopword_pct(doc_id: str) -> float:
+        try:
+            if (
+                "analysis_results" not in st.session_state
+                or st.session_state.analysis_results is None
+            ):
+                return 0.0
+            chunked_docs = _chunked_docs_from_results(st.session_state.analysis_results)
+            chunks = chunked_docs.get(doc_id, [])
+        except Exception:
+            return 0.0
+
+        text = " ".join([c for c in chunks if c])
+        tokens = re.findall(r"\w+", text.lower())
+        if not tokens:
+            return 0.0
+        stopset = get_stopwords()
+        stop_count = sum(1 for t in tokens if t in stopset)
+        return float(stop_count) / float(len(tokens))
+
+    stop_pct_a = _doc_stopword_pct(str(warning.get("doc_a", "")))
+    stop_pct_b = _doc_stopword_pct(str(warning.get("doc_b", "")))
+    high_stop = (stop_pct_a > 0.7) or (stop_pct_b > 0.7)
+
+    existing_warnings = warning.get("warnings")
+    if isinstance(existing_warnings, (list, tuple, set)):
+        warnings_list = list(existing_warnings)
+    elif isinstance(existing_warnings, str):
+        warnings_list = [existing_warnings]
+    else:
+        warnings_list = []
+
+    for wc_key in ("word_count", "word_count_a", "word_count_b"):
+        val = warning.get(wc_key)
+        if val is not None:
+            try:
+                if float(val) < 50:
+                    if WARNING_SHORT_DOCUMENT not in warnings_list:
+                        warnings_list.append(WARNING_SHORT_DOCUMENT)
+                    break
+            except (TypeError, ValueError):
+                pass
+
+    for cc_key in (
+        "control_char_ratio",
+        "control_char_ratio_a",
+        "control_char_ratio_b",
+    ):
+        val = warning.get(cc_key)
+        if val is not None:
+            try:
+                if float(val) > CONTROL_CHARACTER_RATIO_THRESHOLD:
+                    if WARNING_BINARY_CHARACTERS not in warnings_list:
+                        warnings_list.append(WARNING_BINARY_CHARACTERS)
+                    break
+            except (TypeError, ValueError):
+                pass
+
+    res = {
         **dict(warning),
         "doc_a": str(warning.get("doc_a", "")).strip(),
         "doc_b": str(warning.get("doc_b", "")).strip(),
         "similarity": similarity,
         "severity": severity,
         "severity_rank": severity_rank(severity),
+        "stopword_pct_a": stop_pct_a,
+        "stopword_pct_b": stop_pct_b,
+        "high_stopword_density": high_stop,
+        "warning_codes": (["WARNING_HIGH_STOPWORD_DENSITY"] if high_stop else []),
     }
 
+    if warnings_list or "warnings" in warning:
+        res["warnings"] = warnings_list
 
-def _truncate_search_query(search_query: str) -> str:
-    """Limit search input length to avoid expensive matching on oversized strings."""
-    if not isinstance(search_query, str):
+    return res
+
+
+def _truncate_search_query(search_query: Any) -> str:
+    """Limit search input length to avoid expensive matching on oversized strings, safely casting numeric inputs."""
+    if search_query is None:
         return ""
+    if not isinstance(search_query, str):
+        search_query = str(search_query)
     return search_query[:MAX_SEARCH_QUERY_LENGTH].strip()
 
 
@@ -73,42 +297,37 @@ def filter_warnings(
     warnings: Iterable[Mapping[str, Any]],
     search_query: str = "",
     min_match_length: int = 0,
+    severity: str | None = None,
 ) -> list[dict[str, Any]]:
     """Filter normalized warnings using functional predicate matching."""
     normalised = [_normalise_warning(item) for item in warnings]
 
     if min_match_length > 0:
         normalised = [
-            item for item in normalised if item.get("matched_length", 0) >= min_match_length
+            item
+            for item in normalised
+            if item.get("matched_length", 0) >= min_match_length
         ]
 
-    query = _truncate_search_query(search_query).casefold()
-    if not query:
-        return normalised
+    if severity:
+        target = severity.strip().casefold()
+        normalised = [
+            item
+            for item in normalised
+            if str(item.get("severity", "")).strip().casefold() == target
+        ]
 
-    filtered = []
-    for item in normalised:
-        doc_a = item["doc_a"].casefold()
-        doc_b = item["doc_b"].casefold()
-
-        if query in doc_a or query in doc_b:
-            filtered.append(item)
-            continue
-
-        if fuzz is not None:
-            score_a = max(fuzz.partial_ratio(query, doc_a), fuzz.token_set_ratio(query, doc_a))
-            score_b = max(fuzz.partial_ratio(query, doc_b), fuzz.token_set_ratio(query, doc_b))
-            if score_a >= FUZZY_THRESHOLD or score_b >= FUZZY_THRESHOLD:
-                filtered.append(item)
-
-    return filtered
+    predicate = matches_query_predicate(search_query)
+    return [item for item in normalised if predicate(item)]
 
 
 def build_key_extractor(field: str) -> Callable[[Mapping[str, Any]], Any]:
     """Return a key extraction function suitable for sorting warning items."""
+
     def extract_key(item: Mapping[str, Any]) -> Any:
         val = item.get(field, "")
         return val.casefold() if isinstance(val, str) else val
+
     return extract_key
 
 
@@ -181,14 +400,116 @@ def _reset_page() -> None:
     st.session_state.warning_page = 1
 
 
-def render_copy_button(text_to_copy: str, button_id: str = "copy-btn", copy_label: str = "📋 Copy", copied_label: str = "✅ Copied!", height: int = 45) -> None:
-    escaped_text = (
-        text_to_copy.replace("\\", "\\\\")
-        .replace('"', '\\"')
-        .replace("`", "\\`")
-        .replace("$", "\\$")
-        .replace("\n", "\\n")
-    )
+DEFAULT_COPY_BUTTON_ID = "copy-btn"
+
+# An HTML id that is also safe to drop into a JavaScript string literal and a
+# CSS-free ``getElementById`` lookup: letters, digits, hyphen, underscore.
+_SAFE_ELEMENT_ID_RE = re.compile(r"[^A-Za-z0-9_-]+")
+
+# Characters that must not reach a JavaScript string literal verbatim. ``<`` is
+# in the list because ``</script>`` inside a literal still closes the block for
+# the HTML parser, which is how "it is only a string" becomes script execution.
+_JS_STRING_ESCAPES = {
+    "\\": "\\\\",
+    '"': '\\"',
+    "'": "\\'",
+    "`": "\\`",
+    "$": "\\$",
+    "\n": "\\n",
+    "\r": "\\r",
+    "\u2028": "\\u2028",
+    "\u2029": "\\u2029",
+    "<": "\\u003C",
+    ">": "\\u003E",
+    "&": "\\u0026",
+}
+
+
+def sanitize_element_id(
+    raw_id: Any,
+    fallback: str = DEFAULT_COPY_BUTTON_ID,
+) -> str:
+    """Reduce *raw_id* to characters that are safe as an HTML id.
+
+    The id is written into an HTML attribute *and* into a JavaScript string
+    literal inside the same document. Escaping cannot serve both at once —
+    the browser un-escapes the attribute but leaves the literal alone, so the
+    two stop matching and the button silently dies. Restricting the character
+    set instead keeps a single value valid in both places.
+
+    Args:
+        raw_id: Caller-supplied id. Any type; non-strings are stringified.
+        fallback: Used when nothing survives sanitisation.
+
+    Returns:
+        A string of ``[A-Za-z0-9_-]`` only, never empty.
+
+    Examples:
+        >>> sanitize_element_id("copy_ca_3")
+        'copy_ca_3'
+        >>> sanitize_element_id('"><script>alert(1)</script><div id="')
+        'scriptalert1scriptdivid'
+        >>> sanitize_element_id("<<<>>>")
+        'copy-btn'
+    """
+    if raw_id is None:
+        return fallback
+
+    cleaned = _SAFE_ELEMENT_ID_RE.sub("", str(raw_id))
+    return cleaned or fallback
+
+
+def escape_js_string(value: Any) -> str:
+    """Escape *value* for use inside a double-quoted JavaScript string literal.
+
+    Args:
+        value: Any object; it is stringified first.
+
+    Returns:
+        The escaped text, safe to interpolate between two double quotes inside
+        a ``<script>`` block.
+
+    Examples:
+        >>> escape_js_string('</script><script>alert(1)</script>')
+        '\\u003C/script\\u003E\\u003Cscript\\u003Ealert(1)\\u003C/script\\u003E'
+    """
+    text = str(value)
+    return "".join(_JS_STRING_ESCAPES.get(char, char) for char in text)
+
+
+def render_copy_button(
+    text_to_copy: str,
+    button_id: str = DEFAULT_COPY_BUTTON_ID,
+    copy_label: str = "📋 Copy",
+    copied_label: str = "✅ Copied!",
+    height: int = 45,
+) -> None:
+    """Render a clipboard button as an isolated Streamlit HTML component.
+
+    Every caller-supplied value is neutralised for the context it lands in:
+    ``button_id`` is reduced to a safe identifier, the labels are HTML-escaped
+    where they appear as markup and JS-escaped where they are assigned through
+    ``innerHTML``, and the copied text is JS-escaped.
+
+    Args:
+        text_to_copy: Text placed on the clipboard when the button is clicked.
+        button_id: DOM id for the button. Sanitised; see
+            :func:`sanitize_element_id`.
+        copy_label: Button caption in its resting state.
+        copied_label: Button caption shown for two seconds after a copy.
+        height: Height in pixels of the embedded component.
+    """
+    safe_button_id = sanitize_element_id(button_id)
+
+    # Labels appear twice: literally in the markup, and as a JavaScript string
+    # written back through innerHTML. Those are two different contexts and each
+    # needs its own escaping.
+    safe_copy_label = html.escape(str(copy_label))
+    safe_copied_label = html.escape(str(copied_label))
+    js_copy_label = escape_js_string(safe_copy_label)
+    js_copied_label = escape_js_string(safe_copied_label)
+
+    escaped_text = escape_js_string(text_to_copy)
     html_code = f"""
     <style>
         body {{
@@ -197,7 +518,7 @@ def render_copy_button(text_to_copy: str, button_id: str = "copy-btn", copy_labe
             overflow: hidden;
         }}
     </style>
-    <button id="{button_id}" style="
+    <button id="{safe_button_id}" style="
         display: inline-flex;
         align-items: center;
         justify-content: center;
@@ -217,10 +538,10 @@ def render_copy_button(text_to_copy: str, button_id: str = "copy-btn", copy_labe
         box-sizing: border-box;
         transition: background-color 0.2s, color 0.2s, border-color 0.2s;
     " onmouseover="this.style.borderColor='#ff4b4b'; this.style.color='#ff4b4b'" onmouseout="this.style.borderColor='#d6d6d8'; this.style.color='#31333f'">
-        {copy_label}
+        {safe_copy_label}
     </button>
     <script>
-        document.getElementById("{button_id}").addEventListener("click", function() {{
+        document.getElementById("{safe_button_id}").addEventListener("click", function() {{
             const text = "{escaped_text}";
             const textArea = document.createElement("textarea");
             textArea.value = text;
@@ -233,12 +554,12 @@ def render_copy_button(text_to_copy: str, button_id: str = "copy-btn", copy_labe
             try {{
                 const successful = document.execCommand('copy');
                 if (successful) {{
-                    const btn = document.getElementById("{button_id}");
-                    btn.innerHTML = "{copied_label}";
+                    const btn = document.getElementById("{safe_button_id}");
+                    btn.innerHTML = "{js_copied_label}";
                     btn.style.borderColor = "#28a745";
                     btn.style.color = "#28a745";
                     setTimeout(function() {{
-                        btn.innerHTML = "{copy_label}";
+                        btn.innerHTML = "{js_copy_label}";
                         btn.style.borderColor = "#d6d6d8";
                         btn.style.color = "#31333f";
                     }}, 2000);
@@ -253,6 +574,36 @@ def render_copy_button(text_to_copy: str, button_id: str = "copy-btn", copy_labe
     st.components.v1.html(html_code, height=height)
 
 
+def _chunked_docs_from_results(results: Any) -> Mapping[str, Sequence[str]]:
+    """Pull the chunk mapping out of whatever shape ``analysis_results`` has.
+
+    The pipeline result has been a plain tuple, a ``NamedTuple`` and a small
+    result object over the life of this module, and session state can still be
+    holding any of them after a rerun. Reading ``results[1]`` only works for
+    the first two; an object exposing ``chunked_docs`` as a plain attribute
+    raises ``TypeError: ... is not subscriptable``.
+
+    Args:
+        results: The value stored in ``st.session_state.analysis_results``.
+
+    Returns:
+        The document-to-chunks mapping, or an empty mapping when the value
+        does not carry one.
+    """
+    chunked_docs = getattr(results, "chunked_docs", None)
+
+    if chunked_docs is None:
+        try:
+            chunked_docs = results[1]
+        except (TypeError, IndexError, KeyError):
+            return {}
+
+    if not isinstance(chunked_docs, Mapping):
+        return {}
+
+    return chunked_docs
+
+
 def _has_exact_match(doc_a: str, doc_b: str) -> bool:
     """Check if two documents share at least one exact matching chunk (ignoring whitespace)."""
     if (
@@ -260,15 +611,72 @@ def _has_exact_match(doc_a: str, doc_b: str) -> bool:
         or st.session_state.analysis_results is None
     ):
         return False
-    chunked_docs = st.session_state.analysis_results[1]
+    chunked_docs = _chunked_docs_from_results(st.session_state.analysis_results)
     chunks_a = chunked_docs.get(doc_a, [])
     chunks_b = chunked_docs.get(doc_b, [])
 
     # Normalize chunks by removing all whitespace
-    norm_a = {"".join(c.split()) for c in chunks_a if c.strip()}
-    norm_b = {"".join(c.split()) for c in chunks_b if c.strip()}
+    norm_a = {"".join((c.text if hasattr(c, "text") else c).split()) for c in chunks_a if (c.text if hasattr(c, "text") else c).strip()}
+    norm_b = {"".join((c.text if hasattr(c, "text") else c).split()) for c in chunks_b if (c.text if hasattr(c, "text") else c).strip()}
 
     return not norm_a.isdisjoint(norm_b)
+
+
+# When a large proportion of the matching text consists of stop-words
+# the similarity score can be inflated by function words rather than
+# meaningful shared content. Trigger a visible warning when density is
+# above this threshold.
+STOPWORD_DENSITY_WARNING_THRESHOLD = 0.6
+
+
+def _stopword_density_for_flag(flag: Mapping[str, Any]) -> float:
+    """Estimate stop-word density for exact matching chunks between two docs.
+
+    Returns a float 0..1 representing the fraction of tokens in the
+    matching text that are stop-words (using the global stopword manager).
+    """
+    if (
+        "analysis_results" not in st.session_state
+        or st.session_state.analysis_results is None
+    ):
+        return 0.0
+
+    chunked_docs = _chunked_docs_from_results(st.session_state.analysis_results)
+    chunks_a = chunked_docs.get(flag.get("doc_a", ""), [])
+    chunks_b = chunked_docs.get(flag.get("doc_b", ""), [])
+
+    # Build mapping of normalized chunk -> original text for both docs
+    def _norm_map(chunks: Sequence[str]) -> dict[str, str]:
+        m: dict[str, str] = {}
+        for c in chunks:
+            if not c or not c.strip():
+                continue
+            key = "".join(c.split())
+            if key:
+                # keep the first occurrence
+                m.setdefault(key, c)
+        return m
+
+    map_a = _norm_map(chunks_a)
+    map_b = _norm_map(chunks_b)
+    common_keys = set(map_a.keys()).intersection(map_b.keys())
+    if not common_keys:
+        return 0.0
+
+    stopset = get_stopwords()
+    total_tokens = 0
+    stop_tokens = 0
+    for k in common_keys:
+        text = map_a.get(k, "")
+        tokens = re.findall(r"\w+", text.lower())
+        if not tokens:
+            continue
+        total_tokens += len(tokens)
+        stop_tokens += sum(1 for t in tokens if t in stopset)
+
+    if total_tokens == 0:
+        return 0.0
+    return float(stop_tokens) / float(total_tokens)
 
 
 def render_compact_warning_row(flag: Mapping[str, Any]) -> None:
@@ -343,7 +751,7 @@ def render_warning_controls(
             {
                 "key": "clear_threshold",
                 "label": get_text("warn_filter_threshold", lang=lang_code).format(
-                    pct=f"{threshold*100:.0f}"
+                    pct=f"{threshold * 100:.0f}"
                 ),
                 "action": "threshold",
             }
@@ -604,9 +1012,9 @@ def render_warning_controls(
 
     # Generate Markdown Summary of all High & Medium warnings
     summary_flags = [
-        _normalise_warning(flag)
+        nf
         for flag in flags
-        if _normalise_warning(flag)["severity"] in ("High", "Medium")
+        if (nf := _normalise_warning(flag))["severity"] in ("High", "Medium")
     ]
     if not summary_flags:
         markdown_text = get_text("warn_no_summary", lang=lang_code)
@@ -629,8 +1037,6 @@ def render_warning_controls(
             )
         markdown_text = "\n".join(markdown_lines)
 
-
-
     left, middle, right = st.columns([3, 2, 2])
     with left:
         if current_page.total_items:
@@ -648,7 +1054,7 @@ def render_warning_controls(
             text_to_copy=markdown_text,
             button_id="copy-summary-btn",
             copy_label="📋 Copy Summary",
-            copied_label="✅ Copied!"
+            copied_label="✅ Copied!",
         )
     with right:
         st.download_button(
@@ -666,9 +1072,7 @@ def render_warning_controls(
     # with a transition so re-filtered/re-sorted results animate smoothly
     # instead of snapping instantly.
     with st.container(key="warning_list_container"):
-
         for flag in current_page.items:
-
             if compact_view:
                 render_compact_warning_row(flag)
                 st.markdown(
@@ -722,6 +1126,33 @@ def render_warning_controls(
                                         ai_b=ai_b,
                                     )
                                 )
+                            # Document-level stop-word density warning
+                            if flag.get("high_stopword_density", False):
+                                pct_a = flag.get("stopword_pct_a", 0.0) * 100
+                                pct_b = flag.get("stopword_pct_b", 0.0) * 100
+                                parts = []
+                                if pct_a > 70:
+                                    parts.append(f"{flag['doc_a']}: {pct_a:.0f}%")
+                                if pct_b > 70:
+                                    parts.append(f"{flag['doc_b']}: {pct_b:.0f}%")
+                                if parts:
+                                    st.warning(
+                                        f"WARNING_HIGH_STOPWORD_DENSITY — stop-words > 70% in {', '.join(parts)}. "
+                                        "Document-level similarity may be unreliable."
+                                    )
+                        # Warn when matched content is mostly stop-words
+                        try:
+                            density = _stopword_density_for_flag(flag)
+                        except Exception:
+                            density = 0.0
+                        if density >= STOPWORD_DENSITY_WARNING_THRESHOLD:
+                            st.warning(
+                                f"High stop-word density in matching text ({density * 100:.0f}%). "
+                                "Similarity may be inflated by common function words."
+                            )
+                        if flag.get("warnings"):
+                            for w_msg in flag["warnings"]:
+                                st.caption(f"⚠️ {w_msg}")
                     with c2:
                         st.markdown(
                             f"<div style='text-align:right;'>{badge_html(tier, flag['severity'])}</div>",
@@ -771,22 +1202,29 @@ def render_warning_controls(
         ):
             st.session_state.warning_page = current_page.page + 1
             st.rerun()
-def matches_query_predicate(flag: dict, search_query: str) -> bool:
-    """
-    Check if a flagged incident matches a search query across document names or text snippets.
-    """
-    if not search_query or not search_query.strip():
-        return True
 
-    query = search_query.strip().lower()
-    doc_a = str(flag.get("doc_a", "")).lower()
-    doc_b = str(flag.get("doc_b", "")).lower()
-    snippet_a = str(flag.get("snippet_a", "")).lower()
-    snippet_b = str(flag.get("snippet_b", "")).lower()
 
-    return (
-        query in doc_a
-        or query in doc_b
-        or query in snippet_a
-        or query in snippet_b
-    )
+def matches_query_predicate(search_query: str) -> Callable[[Mapping[str, Any]], bool]:
+    """
+    Return a predicate that checks whether a warning matches the given search query.
+    """
+    query = _truncate_search_query(search_query).casefold()
+
+    def predicate(flag: Mapping[str, Any]) -> bool:
+        if not query:
+            return True
+        doc_a = str(flag.get("doc_a", "")).casefold()
+        doc_b = str(flag.get("doc_b", "")).casefold()
+        if query in doc_a or query in doc_b:
+            return True
+        if fuzz is not None:
+            score_a = max(
+                fuzz.partial_ratio(query, doc_a), fuzz.token_set_ratio(query, doc_a)
+            )
+            score_b = max(
+                fuzz.partial_ratio(query, doc_b), fuzz.token_set_ratio(query, doc_b)
+            )
+            return score_a >= FUZZY_THRESHOLD or score_b >= FUZZY_THRESHOLD
+        return False
+
+    return predicate

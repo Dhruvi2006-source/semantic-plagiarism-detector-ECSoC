@@ -99,9 +99,7 @@ def test_tab_health_section_comes_before_tab_settings():
     source = APP_PATH.read_text(encoding="utf-8")
     health_pos = source.index("with tab_health:")
     settings_pos = source.index("with tab_settings:")
-    assert health_pos < settings_pos, (
-        "tab_health must be rendered before tab_settings"
-    )
+    assert health_pos < settings_pos, "tab_health must be rendered before tab_settings"
 
 
 def test_tab_health_is_inside_admin_role_check():
