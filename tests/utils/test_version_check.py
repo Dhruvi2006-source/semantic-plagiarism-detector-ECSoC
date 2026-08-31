@@ -115,6 +115,24 @@ class TestIsUpdateAvailable:
     def test_no_update_exact_match(self) -> None:
         assert is_update_available("1.2.3", "v1.2.3") is False
 
+    def test_numeric_sort_not_lexicographic(self) -> None:
+        assert is_update_available("1.2.0", "1.10.0") is True
+
+    def test_numeric_sort_reverse_direction(self) -> None:
+        assert is_update_available("1.10.0", "1.2.0") is False
+
+    def test_major_version_bump_two_vs_one_nine_nine(self) -> None:
+        assert is_update_available("1.9.9", "2.0.0") is True
+
+    def test_no_update_when_remote_older_major(self) -> None:
+        assert is_update_available("2.0.0", "1.9.9") is False
+
+    def test_equal_versions_no_v_prefix(self) -> None:
+        assert is_update_available("1.0.0", "1.0.0") is False
+
+    def test_equal_versions_mixed_v_prefix(self) -> None:
+        assert is_update_available("1.0.0", "v1.0.0") is False
+
 
 # ── fetch_latest_github_version ────────────────────────────────────────────────
 
@@ -309,3 +327,4 @@ def test_app_version_is_non_empty() -> None:
 def test_github_releases_url_is_valid() -> None:
     assert GITHUB_RELEASES_URL.startswith("https://api.github.com/repos/")
     assert "/releases/latest" in GITHUB_RELEASES_URL
+    
