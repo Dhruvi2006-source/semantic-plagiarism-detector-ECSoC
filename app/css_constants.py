@@ -74,6 +74,22 @@ PIPELINE_STEP_DONE = "pipeline-step done"
 PIPELINE_ARROW = "pipeline-arrow"
 """Arrow separator between pipeline steps."""
 
+PIPELINE_DONE = "done"
+"""Completed pipeline step state."""
+
+PIPELINE_ACTIVE = "active"
+"""Active pipeline step state."""
+
+PIPELINE_ETA = "pipeline-eta"
+"""Estimated processing time container."""
+
+DOC_ROW = "doc-row"
+"""Document listing row."""
+
+WELCOME_BANNER = "welcome-banner"
+"""Dashboard welcome banner."""
+
+
 # ── Mono text ──────────────────────────────────────────────────────────────────
 
 MONO_TEXT = "mono-text"
@@ -89,6 +105,12 @@ WARNING_CARD_MEDIUM = "warning-card-medium"
 
 WARNING_CARD_LOW = "warning-card-low"
 """Low severity warning card accent border."""
+
+LOW_CONFIDENCE_CARD = "low-confidence-card"
+"""Low confidence detection card amber accent border."""
+
+HIGH_SEVERITY_ROW = "high-severity-row"
+"""High severity plagiarism row accent border."""
 
 # ── Login container classes ────────────────────────────────────────────────────
 
@@ -175,34 +197,84 @@ ST_TABS = "stTabs"
 ST_TABS_BUTTON = "stTabs button"
 """Individual tab button."""
 
-ST_TABS_BUTTON_ACTIVE = "stTabs button[aria-selected=\"true\"]"
+ST_TABS_BUTTON_ACTIVE = 'stTabs button[aria-selected="true"]'
 """Active (selected) tab button."""
-CLASS_BADGE = "badge"
-CLASS_SIM_PILL = "sim-pill"
 
-CLASS_EMPTY_STATE = "empty-state"
-CLASS_EMPTY_ICON = "empty-icon"
-CLASS_EMPTY_TITLE = "empty-title"
-CLASS_EMPTY_DESC = "empty-desc"
+# ── Mobile layout ──────────────────────────────────────────────────────────────
 
-CLASS_SIDEBAR_USER_BADGE = "sidebar-user-badge"
-CLASS_AVATAR = "avatar"
+MOBILE_LAYOUT_CSS = """
+@media (max-width: 768px) {
+    .block-container {
+        padding-top: 1rem !important;
+        padding-right: 0.75rem !important;
+        padding-left: 0.75rem !important;
+        padding-bottom: 1rem !important;
+    }
 
-CLASS_PIPELINE_STEP = "pipeline-step"
-CLASS_PIPELINE_DONE = "done"
-CLASS_PIPELINE_ACTIVE = "active"
-CLASS_PIPELINE_ARROW = "pipeline-arrow"
-CLASS_PIPELINE_STEPS = "pipeline-steps"
-CLASS_PIPELINE_ETA = "pipeline-eta"
+    [data-testid="stPlotlyChart"],
+    .stPlotlyChart {
+        height: 280px !important;
+        max-height: 280px !important;
+    }
 
-CLASS_DOC_ROW = "doc-row"
+    [data-testid="stPlotlyChart"] .js-plotly-plot,
+    .js-plotly-plot {
+        height: 260px !important;
+        max-height: 260px !important;
+    }
+}
+"""
+"""Responsive rules for narrow viewports: tighter padding and shorter charts."""
 
-CLASS_WELCOME_BANNER = "welcome-banner"
-CLASS_SKELETON = "skeleton"
-CLASS_SKELETON_METRIC = "skeleton-metric"
-CLASS_SKELETON_TITLE = "skeleton-title"
-CLASS_SKELETON_TEXT = "skeleton-text"
-CLASS_SKELETON_TEXT_SHORT = "skeleton-text-short"
-CLASS_SKELETON_CHART = "skeleton-chart"
-CLASS_SKELETON_TABLE = "skeleton-table"
-CLASS_CLEAR_ALL_CONTAINER = "clear-all-container"
+# ── Namespaced CSS custom properties (Issue #3762) ──────────────────────────────
+#
+# app.theme.THEMES already defines the Light/Dark color palettes and
+# app.theme.inject_css() already writes a :root {} block with generic
+# variable names (--primary-bg, --accent-color, etc.). This adds a second,
+# explicitly "spd-" namespaced set of the same values, so UI components can
+# opt in to a stable, collision-resistant variable naming convention
+# (--spd-primary, --spd-bg, --spd-bg-card, ...) instead of hardcoding hex
+# colors directly in inline styles.
+#
+# Deliberately NOT hardcoded here: the values are supplied by the caller
+# (app.theme.inject_css) at injection time, so switching between Light and
+# Dark themes still updates every --spd-* variable along with the existing
+# generic ones, with no second source of truth for the actual color values.
+
+
+def spd_root_css_variables(colors: dict, accent_hex: str) -> str:
+    """Return a ``:root { --spd-...: ...; }`` block using the "spd-" prefix.
+
+    Args:
+        colors: A theme color dict shaped like one of app.theme.THEMES's
+            values (keys: background, surface, card, ink, muted, border,
+            input, danger, danger_soft, warning, warning_soft, success,
+            success_soft, neutral_soft). Values should already be sanitized
+            hex colors (see app.theme.sanitize_theme_colors).
+        accent_hex: The active theme's accent/brand color, already sanitized.
+
+    Returns:
+        A CSS string containing one ``:root { ... }`` rule. Meant to be
+        concatenated into the larger stylesheet built by
+        app.theme.inject_css(), not injected on its own.
+    """
+    return f"""
+        :root {{
+            --spd-primary: {accent_hex};
+            --spd-primary-color: {accent_hex};
+            --spd-bg: {colors["background"]};
+            --spd-bg-card: {colors["card"]};
+            --spd-bg-surface: {colors["surface"]};
+            --spd-text: {colors["ink"]};
+            --spd-text-muted: {colors["muted"]};
+            --spd-border: {colors["border"]};
+            --spd-input-bg: {colors["input"]};
+            --spd-danger: {colors["danger"]};
+            --spd-danger-soft: {colors["danger_soft"]};
+            --spd-warning: {colors["warning"]};
+            --spd-warning-soft: {colors["warning_soft"]};
+            --spd-success: {colors["success"]};
+            --spd-success-soft: {colors["success_soft"]};
+            --spd-neutral-soft: {colors["neutral_soft"]};
+        }}
+    """

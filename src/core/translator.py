@@ -2,7 +2,17 @@
 
 from __future__ import annotations
 
-from deep_translator import GoogleTranslator
+import logging
+import os
+import re
+import time
+
+from deep_translator import DeeplTranslator, GoogleTranslator
+
+logger = logging.getLogger(__name__)
+
+# In-memory pipeline cache for MarianMT models: (source_lang, target_lang) -> pipeline
+_MARIAN_PIPELINES: dict[tuple[str, str], object] = {}
 
 # Comprehensive ISO-639-1 (and ISO-639-2) language code database
 ISO_639_LANGUAGES: dict[str, dict[str, str]] = {
@@ -198,6 +208,84 @@ LANGUAGE_NAME_MAP: dict[str, str] = {
 }
 
 
+def _batch_sentences(text: str, max_chars: int = 4500) -> list[str]:
+    """Helper to split long text into smaller batches by sentence boundaries."""
+    # Split by punctuation followed by space (basic sentence boundary)
+    sentences = re.split(r'(?<=[.!?])\s+', text)
+    
+    batches = []
+    current_batch = ""
+    
+    for sentence in sentences:
+        if len(current_batch) + len(sentence) + 1 <= max_chars:
+            current_batch += (sentence + " ").lstrip()
+        else:
+            if current_batch:
+                batches.append(current_batch.strip())
+            current_batch = sentence + " "
+            
+    if current_batch.strip():
+        batches.append(current_batch.strip())
+        
+    # Safety net: If a single sentence without punctuation is still longer than max_chars
+    final_batches = []
+    for batch in batches:
+        if len(batch) > max_chars:
+            for i in range(0, len(batch), max_chars):
+                final_batches.append(batch[i:i + max_chars])
+        else:
+            final_batches.append(batch)
+
+    return final_batches
+
+
+def translate_text_marian(
+    text: str,
+    source_lang: str = "es",
+    target_lang: str = "en",
+) -> str:
+    """Translate text offline using local HuggingFace MarianMT (Helsinki-NLP/opus-mt) models.
+
+    Args:
+        text: Input text string to translate.
+        source_lang: Source language ISO code (e.g., 'es', 'fr', 'de').
+        target_lang: Target language ISO code (e.g., 'en').
+
+    Returns:
+        Translated text string, or error marker on model loading failure.
+    """
+    if not text or not str(text).strip():
+        return str(text or "")
+
+    src = (source_lang or "es").strip().lower()
+    tgt = (target_lang or "en").strip().lower()
+    if src == "auto":
+        src = "es"
+
+    cache_key = (src, tgt)
+    pipe = _MARIAN_PIPELINES.get(cache_key)
+
+    if pipe is None:
+        try:
+            from transformers import pipeline
+
+            model_name = f"Helsinki-NLP/opus-mt-{src}-{tgt}"
+            pipe = pipeline("translation", model=model_name)
+            _MARIAN_PIPELINES[cache_key] = pipe
+        except Exception as exc:
+            logger.error("Failed to load MarianMT model for %s->%s: %s", src, tgt, exc)
+            return f"(Translation Error: MarianMT {exc})"
+
+    try:
+        results = pipe(str(text))
+        if isinstance(results, list) and len(results) > 0 and "translation_text" in results[0]:
+            return str(results[0]["translation_text"]).strip()
+        return str(results).strip()
+    except Exception as exc:
+        logger.error("MarianMT translation execution error: %s", exc)
+        return f"(Translation Error: {exc})"
+
+
 def translate_text(
     text: str | None,
     target_lang: str = "en",
@@ -222,19 +310,150 @@ def translate_text(
     if not original.strip():
         return original
 
-    try:
-        translated = GoogleTranslator(
-            source=source_lang or "auto",
-            target=target_lang,
-        ).translate(original)
-    except Exception as exc:
-        return f"(Translation Error: {exc})"
+    # Chunking logic for texts exceeding API limits
+    if len(original) > 4500:
+        batches = _batch_sentences(original, max_chars=4500)
+        translated_batches = []
+        for batch in batches:
+            chunk_trans = translate_text(batch, target_lang=target_lang, source_lang=source_lang)
+            if chunk_trans and str(chunk_trans).startswith("(Translation Error:"):
+                # If any chunk fails with a network/translation error, return the error
+                return chunk_trans
+            translated_batches.append(chunk_trans or "")
+        return " ".join(translated_batches).strip()
+
+    # Check for offline translation via HuggingFace MarianMT (#3988)
+    if os.getenv("OFFLINE_TRANSLATION_ENABLED", "").lower() in ("true", "1", "yes"):
+        res = translate_text_marian(original, source_lang=source_lang, target_lang=target_lang)
+        return res
+
+    deepl_api_key = os.getenv("DEEPL_API_KEY")
+    translated = None
+
+    if deepl_api_key:
+        try:
+            # DeeplTranslator uses api_key parameter
+            deepl_source = "auto" if not source_lang or source_lang == "auto" else source_lang
+            translated = DeeplTranslator(
+                api_key=deepl_api_key,
+                source=deepl_source,
+                target=target_lang,
+            ).translate(original)
+        except Exception as exc:
+            logger.warning("DeepL translation failed, falling back to GoogleTranslator: %s", exc)
+            translated = None
+
+    if translated is None:
+        max_retries = 3
+        last_exc = None
+
+        for attempt in range(max_retries):
+            try:
+                translated = GoogleTranslator(
+                    source=source_lang or "auto",
+                    target=target_lang,
+                ).translate(original)
+                break
+            except Exception as exc:
+                last_exc = exc
+                if attempt < max_retries - 1:
+                    sleep_time = 2**attempt  # 1s, 2s, 4s
+                    logger.warning(
+                        "Translation failed on attempt %d/%d (%s). Retrying in %ds...",
+                        attempt + 1,
+                        max_retries,
+                        exc,
+                        sleep_time,
+                    )
+                    time.sleep(sleep_time)
+
+        if last_exc and translated is None:
+            return f"(Translation Error: {last_exc})"
 
     translated = str(translated or "").strip()
     if not translated:
         return f"(Translation Error: empty response for target '{target_lang}')"
 
     return translated
+
+
+def translate_text_secondary(
+    text: str,
+    target_lang: str = "en",
+    source_lang: str = "auto",
+) -> str:
+    """Fallback translation service using an offline/secondary translator.
+
+    If MyMemoryTranslator is available, it uses it. Swaps to a mock
+    offline fallback translation string on connection/provider failures.
+    """
+    if not text:
+        return ""
+
+    try:
+        from deep_translator import MyMemoryTranslator
+        translated = MyMemoryTranslator(
+            source=source_lang or "auto",
+            target=target_lang,
+        ).translate(text)
+        if translated:
+            return str(translated).strip()
+    except Exception:
+        pass
+
+    return f"[Offline Fallback -> {target_lang}]: {text}"
+
+
+def translate_text_batch(
+    texts: list[str],
+    target_lang: str = "en",
+    source_lang: str = "auto",
+) -> list[str]:
+    """Translate a batch list of text strings.
+
+    Args:
+        texts: List of strings to translate.
+        target_lang: Target language code.
+        source_lang: Source language code.
+
+    Returns:
+        List of translated strings.
+    """
+    if not texts:
+        return []
+
+    validate_target_language_code(target_lang)
+
+    deepl_api_key = os.getenv("DEEPL_API_KEY")
+    if deepl_api_key:
+        try:
+            deepl_source = "auto" if not source_lang or source_lang == "auto" else source_lang
+            translated = DeeplTranslator(
+                api_key=deepl_api_key,
+                source=deepl_source,
+                target=target_lang,
+            ).translate_batch(texts)
+            return [str(t or "").strip() for t in translated]
+        except Exception as exc:
+            logger.warning("DeepL batch translation failed, falling back to GoogleTranslator: %s", exc)
+
+    try:
+        translated = GoogleTranslator(
+            source=source_lang or "auto",
+            target=target_lang,
+        ).translate_batch(texts)
+        return [str(t or "").strip() for t in translated]
+    except Exception as exc:
+        logger.error("Batch translation error: %s", exc)
+        # Fallback to translate_text individually for resilience
+        results = []
+        for text in texts:
+            try:
+                res = translate_text(text, target_lang=target_lang, source_lang=source_lang)
+                results.append(res or "")
+            except Exception:
+                results.append(f"(Translation Error: {exc})")
+        return results
 
 
 def get_language_name(code: str) -> str:
@@ -300,6 +519,26 @@ def is_valid_language_code(code: str) -> bool:
     if not code or not isinstance(code, str):
         return False
     return code.strip().lower() in ISO_639_LANGUAGES
+
+
+def validate_target_language_code(lang_code: str) -> bool:
+    """Validate a target language code against the ISO-639-1 language code set.
+
+    Args:
+        lang_code: Target language code to validate (case-insensitive).
+
+    Returns:
+        True if the code is a supported ISO-639-1 language code.
+
+    Raises:
+        ValueError: If the language code is not a supported ISO-639-1 code.
+    """
+    if (
+        not isinstance(lang_code, str)
+        or lang_code.strip().lower() not in ISO_639_LANGUAGES
+    ):
+        raise ValueError(f"Unsupported target language code: {lang_code}")
+    return True
 
 
 def get_supported_language_codes() -> list[str]:
@@ -396,6 +635,23 @@ def format_language_display(code: str, include_native: bool = True) -> str:
     return name
 
 
+def get_language_display_name(code: str) -> str:
+    """
+    Map ISO-639-1 code to full language name (e.g. 'de' -> 'German').
+    Return uppercase code string if language is unmapped.
+
+    Args:
+        code: ISO-639-1 language code.
+
+    Returns:
+        Full language name or uppercase code.
+    """
+    if not code or not isinstance(code, str):
+        return ""
+    normalized = code.strip().lower()
+    return LANGUAGE_NAME_MAP.get(normalized, code.strip().upper())
+
+
 def get_common_translation_pairs() -> list[tuple[str, str]]:
     """Return a list of primary cross-lingual translation language code pairs.
 
@@ -414,3 +670,4 @@ def get_common_translation_pairs() -> list[tuple[str, str]]:
         ("pt", "en"),
         ("it", "en"),
     ]
+# Helper function verified for issue 3993

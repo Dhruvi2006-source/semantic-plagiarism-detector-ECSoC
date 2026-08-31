@@ -9,15 +9,20 @@ import re
 import unicodedata
 from collections.abc import Collection, Mapping
 from pathlib import PurePath
-from typing import TypeVar
+from typing import IO, TypeVar
 
-
-DEFAULT_FILENAME = "document"
+DEFAULT_FILENAME = os.getenv("DEFAULT_FALLBACK_FILENAME", "document")
+# Upper bound on a sanitized filename, in characters.
+#
+# 128 leaves headroom under the 255-byte limit most filesystems impose, which
+# matters because a single character can occupy up to four bytes once encoded,
+# and under the shorter limits that apply inside archives and on the export
+# paths a name is later joined onto.
 MAX_FILENAME_LENGTH = 128
 
 _HTML_TAG_RE = re.compile(r"<[^>]*>")
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
-_UNSAFE_RE = re.compile(r"[^A-Za-z0-9._ -]+")
+_UNSAFE_RE = re.compile(r"[^\w._ -]+", re.UNICODE)
 _SEPARATOR_RE = re.compile(r"[\s_-]+")
 _DOT_RE = re.compile(r"\.{2,}")
 _WINDOWS_RESERVED_NAMES = {
@@ -65,6 +70,66 @@ def get_file_sha256_hash(file_bytes: bytes) -> str:
     return hashlib.sha256(file_bytes).hexdigest()
 
 
+def compute_file_hash_stream(
+    file_stream: IO[bytes],
+    chunk_size: int = 1024 * 1024,
+) -> str:
+    """Return the SHA-256 hex digest for a file-like object.
+
+    The stream is read incrementally in fixed-size chunks to avoid loading
+    the entire file into memory.
+
+    Args:
+        file_stream: Binary stream to read and hash.
+        chunk_size: Number of bytes per read iteration (default 1 MB = 1024 * 1024).
+
+    Returns:
+        The hexadecimal SHA-256 hash string.
+    """
+    hasher = hashlib.sha256()
+
+    while chunk := file_stream.read(chunk_size):
+        hasher.update(chunk)
+
+    return hasher.hexdigest()
+
+
+_SHA256_HEX_RE = re.compile(r"[0-9a-fA-F]{64}")
+
+
+def normalize_sha256_hash(hash_str: str) -> str:
+    """Validate a SHA-256 hex digest and return it in lower-case form.
+
+    Args:
+        hash_str: A 64-character hexadecimal SHA-256 digest, in any case.
+
+    Returns:
+        str: The digest normalized to lower-case.
+
+    Raises:
+        ValueError: If the input is not a 64-character hexadecimal string.
+    """
+    if not isinstance(hash_str, str) or not _SHA256_HEX_RE.fullmatch(hash_str):
+        raise ValueError("Invalid SHA-256 hash: expected a 64-character hex string.")
+
+    return hash_str.lower()
+
+
+def is_windows_reserved_name(name: str) -> bool:
+    """Return True if the name or its base stem matches a Windows reserved device name.
+
+    Windows prohibits device names both standalone and with extensions (e.g.
+    'NUL', 'NUL.txt', 'CON.pdf', 'COM1.docx', 'aux.tar.gz').
+    """
+    if not name or not isinstance(name, str):
+        return False
+    normalized = name.strip(" ._-").upper()
+    if normalized in _WINDOWS_RESERVED_NAMES:
+        return True
+    base = normalized.split(".")[0]
+    return base in _WINDOWS_RESERVED_NAMES
+
+
 def sanitize_filename(
     filename: object,
     *,
@@ -83,7 +148,7 @@ def sanitize_filename(
         raise ValueError("max_length must be at least 8.")
 
     raw = html.unescape(str(filename or ""))
-    raw = unicodedata.normalize("NFKC", raw)
+    raw = unicodedata.normalize("NFC", raw)
     raw = _CONTROL_RE.sub("", raw)
 
     # Strip markup before selecting the basename. Closing tags contain "/"
@@ -106,7 +171,7 @@ def sanitize_filename(
     if not stem:
         stem = safe_fallback
 
-    if stem.upper() in _WINDOWS_RESERVED_NAMES:
+    if is_windows_reserved_name(stem):
         stem = f"_{stem}"
 
     maximum_stem_length = max_length - len(extension)
@@ -128,7 +193,15 @@ def sanitize_filename(
         if not stem:
             stem = safe_fallback[:maximum_stem_length] or DEFAULT_FILENAME
 
-    return f"{stem}{extension}"
+    sanitized = f"{stem}{extension}"
+    if sanitized.startswith("."):
+        stem_fallback = fallback or DEFAULT_FILENAME
+        stem_fallback = stem_fallback.strip(" ._-")
+        if not stem_fallback:
+            stem_fallback = DEFAULT_FILENAME
+        sanitized = f"{stem_fallback}{sanitized}"
+
+    return sanitized
 
 
 def unique_filename(
@@ -138,7 +211,15 @@ def unique_filename(
     fallback: str = DEFAULT_FILENAME,
     max_length: int = MAX_FILENAME_LENGTH,
 ) -> str:
-    """Return a sanitized filename that does not collide with existing names."""
+    """Return a sanitized filename that does not collide with existing names.
+
+    The result never exceeds ``max_length``, whatever the collision count.
+
+    Raises:
+        ValueError: If ``max_length`` cannot hold the extension alongside the
+            counter needed to disambiguate. This requires an unusually small
+            limit together with a very large number of colliding names.
+    """
     safe_name = sanitize_filename(
         filename,
         fallback=fallback,
@@ -155,6 +236,19 @@ def unique_filename(
     while True:
         suffix = f"_{counter}"
         allowed_stem = max_length - len(extension) - len(suffix)
+
+        # A negative budget used to be handed straight to the slice, where
+        # stem[:-2] trims from the *end* instead of clamping to nothing. The
+        # candidate then came out longer than max_length — exactly the limit
+        # this function exists to enforce.
+        if allowed_stem < 0:
+            raise ValueError(
+                f"max_length={max_length} is too small to disambiguate "
+                f"{safe_name!r}: the extension {extension!r} and the counter "
+                f"suffix {suffix!r} need {len(extension) + len(suffix)} "
+                "characters between them."
+            )
+
         candidate_stem = stem[:allowed_stem].rstrip(" ._-")
         candidate = f"{candidate_stem}{suffix}{extension}"
 
@@ -258,10 +352,11 @@ def get_final_extension(filename: object) -> str:
     from hiding an executable payload, such as ``document.pdf.exe``.
     """
     raw = html.unescape(str(filename or ""))
-    raw = unicodedata.normalize("NFKC", raw)
+    raw = unicodedata.normalize("NFC", raw)
     raw = _CONTROL_RE.sub("", raw)
+    raw = _HTML_TAG_RE.sub("", raw)
     basename = _basename(raw).strip()
-    _stem, extension = os.path.splitext(basename)
+    stem, extension = os.path.splitext(basename)
     return extension.casefold()
 
 
@@ -275,7 +370,42 @@ def get_file_extension_sanitized(filename: str) -> str:
     return extension.lower()
 
 
-def validate_document_extension(    filename: object,
+_EXTENSION_BADGES: dict[str, str] = {
+    ".pdf": "📄 PDF",
+    ".docx": "📝 DOCX",
+    ".doc": "📝 DOC",
+    ".txt": "📑 TXT",
+    ".csv": "📊 CSV",
+    ".epub": "📚 EPUB",
+    ".rtf": "📃 RTF",
+    ".zip": "📦 ZIP",
+}
+_DEFAULT_EXTENSION_BADGE = "📁 FILE"
+
+
+def format_extension_badge(filename: str) -> str:
+    """Return a color-coded emoji badge describing a filename's format.
+
+    Used in document list views so filenames aren't shown as plain text
+    with no visual indication of file type, e.g. ``"📄 PDF"`` for a
+    ``.pdf`` file. Falls back to a generic file badge for unrecognized or
+    missing extensions.
+
+    Examples
+    --------
+    >>> format_extension_badge("report.pdf")
+    '📄 PDF'
+    >>> format_extension_badge("notes.CSV")
+    '📊 CSV'
+    >>> format_extension_badge("no_extension")
+    '📁 FILE'
+    """
+    extension = get_final_extension(filename)
+    return _EXTENSION_BADGES.get(extension, _DEFAULT_EXTENSION_BADGE)
+
+
+def validate_document_extension(
+    filename: object,
     *,
     allowed_extensions: Collection[str] = DEFAULT_ALLOWED_DOCUMENT_EXTENSIONS,
     require_extension: bool = True,
@@ -314,8 +444,7 @@ def validate_document_extension(    filename: object,
 
     if final_extension in DANGEROUS_EXECUTABLE_EXTENSIONS:
         raise InvalidFileExtensionError(
-            "Executable or script file extensions are not allowed: "
-            f"{final_extension}"
+            f"Executable or script file extensions are not allowed: {final_extension}"
         )
 
     if final_extension not in normalized_allowed:

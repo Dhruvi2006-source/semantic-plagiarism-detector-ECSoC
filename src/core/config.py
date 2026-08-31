@@ -11,7 +11,7 @@ import json
 import logging
 import os
 import re
-from typing import Optional, Dict, Any
+from typing import Any, Optional
 
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -21,8 +21,12 @@ DEFAULT_BRAND_COLOR = "#1e3a8a"
 DEFAULT_LOGO_PATH = None
 
 # Path to branding config file (relative to project root)
-BRANDING_CONFIG_PATH = os.path.abspath(
-    os.path.join(os.path.dirname(__file__), "..", "..", "branding_config.json")
+BRANDING_CONFIG_PATH = os.path.join(
+    os.path.dirname(__file__),
+    "..",
+    "..",
+    "config",
+    "branding_config.json",
 )
 
 
@@ -65,7 +69,7 @@ class BrandingConfig:
         self.logo_path = logo_path
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "BrandingConfig":
+    def from_dict(cls, data: dict[str, Any]) -> "BrandingConfig":
         """
         Create BrandingConfig from dictionary with validation.
 
@@ -96,7 +100,7 @@ class BrandingConfig:
 
         return cls(brand_color=brand_color, logo_path=logo_path)
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         """
         Convert BrandingConfig to dictionary.
 
@@ -186,10 +190,12 @@ def reload_branding_config() -> BrandingConfig:
     global _branding_config
     _branding_config = load_branding_config()
     return _branding_config
+
+
 """Central plagiarism threshold and severity configuration."""
 
-from dataclasses import dataclass
 import os
+from dataclasses import dataclass
 from math import isfinite
 from numbers import Real
 from typing import Final, Mapping
@@ -212,7 +218,25 @@ SEVERITY_RANK: Final[Mapping[str, int]] = {
 # Embedding batch size configuration (default: 32)
 EMBEDDING_BATCH_SIZE: Final[int] = int(os.getenv("EMBEDDING_BATCH_SIZE", "32"))
 
+# Minimum consecutive words for a highlighted match in side-by-side diffs.
+DEFAULT_DIFF_MIN_MATCH_LENGTH: Final[int] = int(
+    os.getenv("DEFAULT_DIFF_MIN_MATCH_LENGTH", "4")
+)
 
+# Cross-Encoder re-ranking stage (Issue #3911). FAISS/bi-encoder retrieval
+# stays the first-stage candidate search; only the top-K highest scoring
+# candidates are passed through the cross-encoder for precise re-scoring.
+CROSS_ENCODER_RERANKING_ENABLED: Final[bool] = os.getenv(
+    "CROSS_ENCODER_RERANKING_ENABLED", "true"
+).strip().lower() not in ("false", "0", "")
+DEFAULT_CROSS_ENCODER_MODEL: Final[str] = os.getenv(
+    "CROSS_ENCODER_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2"
+)
+DEFAULT_CROSS_ENCODER_TOP_K: Final[int] = int(os.getenv("CROSS_ENCODER_TOP_K", "50"))
+
+CORPUS_NEAR_DUPLICATE_THRESHOLD = float(
+    os.getenv("CORPUS_NEAR_DUPLICATE_THRESHOLD", "0.92")
+)
 @dataclass(frozen=True)
 class SimilarityThresholds:
     """Validated plagiarism and severity boundaries."""
@@ -228,8 +252,7 @@ class SimilarityThresholds:
 
         if not plagiarism <= medium <= high:
             raise ValueError(
-                "Thresholds must satisfy "
-                "0.0 <= plagiarism <= medium <= high <= 1.0."
+                "Thresholds must satisfy 0.0 <= plagiarism <= medium <= high <= 1.0."
             )
 
         object.__setattr__(self, "plagiarism", plagiarism)
@@ -258,8 +281,7 @@ def validate_thresholds(
 
     if not thresholds.plagiarism <= thresholds.medium <= thresholds.high:
         raise ValueError(
-            "Thresholds must satisfy "
-            "0.0 <= plagiarism <= medium <= high <= 1.0."
+            "Thresholds must satisfy 0.0 <= plagiarism <= medium <= high <= 1.0."
         )
 
     return thresholds
@@ -267,6 +289,153 @@ def validate_thresholds(
 
 DEFAULT_THRESHOLDS: Final[SimilarityThresholds] = SimilarityThresholds()
 PLAGIARISM_THRESHOLD: Final[float] = DEFAULT_THRESHOLDS.plagiarism
+
+# Default location of an optional on-disk threshold config (Issue #2267).
+# When present, load_threshold_config() reads recommended boundaries from it;
+# when absent (the default), behavior is unchanged and DEFAULT_THRESHOLDS is used.
+THRESHOLD_CONFIG_PATH: Final[str] = os.path.join(
+    os.path.dirname(__file__),
+    "..",
+    "..",
+    "config",
+    "thresholds.json",
+)
+
+# Calibrated thresholds storage (Issue #3912)
+CALIBRATED_THRESHOLDS_PATH: Final[str] = os.path.join(
+    os.path.dirname(__file__),
+    "..",
+    "..",
+    "config",
+    "calibrated_thresholds.json",
+)
+
+# Incremental FAISS index metadata (Issue #3913)
+FAISS_INDEX_METADATA_PATH: Final[str] = os.path.join(
+    os.path.dirname(__file__),
+    "..",
+    "..",
+    "config",
+    "faiss_index_metadata.json",
+)
+
+# Enable incremental index updates instead of full rebuild
+INCREMENTAL_INDEX_ENABLED: Final[bool] = os.getenv(
+    "INCREMENTAL_INDEX_ENABLED", "true"
+).strip().lower() not in ("false", "0", "")
+
+# Threshold for document changes triggering full index rebuild (%)
+INCREMENTAL_INDEX_REBUILD_THRESHOLD: Final[float] = float(
+    os.getenv("INCREMENTAL_INDEX_REBUILD_THRESHOLD", "50.0")
+)
+
+# FAISS HNSW Configuration (Issue #4030)
+FAISS_INDEX_TYPE: Final[str] = os.getenv("FAISS_INDEX_TYPE", "auto").strip().lower()
+FAISS_HNSW_EF_CONSTRUCTION: Final[int] = int(
+    os.getenv("FAISS_HNSW_EF_CONSTRUCTION", "100")
+)
+FAISS_HNSW_EF_SEARCH: Final[int] = int(os.getenv("FAISS_HNSW_EF_SEARCH", "64"))
+
+
+def load_calibrated_thresholds(
+    calibration_id: Optional[str] = None,
+) -> Optional[SimilarityThresholds]:
+    """Load calibrated thresholds from disk by calibration_id, or return None.
+
+    Args:
+        calibration_id: Specific calibration version to load. If None, loads the latest.
+
+    Returns:
+        SimilarityThresholds instance if calibration file exists, else None.
+    """
+    if not os.path.exists(CALIBRATED_THRESHOLDS_PATH):
+        return None
+
+    try:
+        with open(CALIBRATED_THRESHOLDS_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        if not isinstance(data, dict):
+            return None
+
+        # If calibration_id specified, look for that version
+        if calibration_id and calibration_id in data.get("calibrations", {}):
+            cal_data = data["calibrations"][calibration_id]
+            return SimilarityThresholds(
+                plagiarism=float(
+                    cal_data.get("plagiarism", DEFAULT_THRESHOLDS.plagiarism)
+                ),
+                medium=float(cal_data.get("medium", DEFAULT_THRESHOLDS.medium)),
+                high=float(cal_data.get("high", DEFAULT_THRESHOLDS.high)),
+            )
+
+        # Otherwise, load latest calibration
+        if data.get("latest_calibration_id"):
+            cal_data = data["calibrations"][data["latest_calibration_id"]]
+            return SimilarityThresholds(
+                plagiarism=float(
+                    cal_data.get("plagiarism", DEFAULT_THRESHOLDS.plagiarism)
+                ),
+                medium=float(cal_data.get("medium", DEFAULT_THRESHOLDS.medium)),
+                high=float(cal_data.get("high", DEFAULT_THRESHOLDS.high)),
+            )
+
+        return None
+    except Exception as e:
+        logger.warning("Failed to load calibrated thresholds: %s", e)
+        return None
+
+
+def load_threshold_config(
+    config_path: Optional[str] = None,
+) -> SimilarityThresholds:
+    """Load recommended similarity thresholds from a JSON config file.
+
+    Reads a JSON object with optional ``plagiarism``, ``medium`` and ``high``
+    keys (each in the inclusive ``[0.0, 1.0]`` range) and returns a validated
+    :class:`SimilarityThresholds` instance.
+
+    When *config_path* is ``None`` the environment variable
+    ``THRESHOLD_CONFIG_PATH`` (falling back to ``config/thresholds.json``
+    relative to the repo root) is used.
+
+    If the file is missing, unreadable, or contains invalid values the
+    defaults are returned unchanged, so supplying no calibration config never
+    alters existing detection behavior.
+
+    Args:
+        config_path: Optional explicit path to the threshold JSON file.
+
+    Returns:
+        The validated thresholds from the file, or ``DEFAULT_THRESHOLDS``.
+    """
+    if config_path is None:
+        config_path = os.getenv("THRESHOLD_CONFIG_PATH", THRESHOLD_CONFIG_PATH)
+
+    if not os.path.exists(config_path):
+        return DEFAULT_THRESHOLDS
+
+    try:
+        with open(config_path, "r", encoding="utf-8") as stream:
+            data = json.load(stream)
+        if not isinstance(data, dict):
+            logger.warning(
+                "Threshold config %s is not a JSON object. Using defaults.",
+                config_path,
+            )
+            return DEFAULT_THRESHOLDS
+        return SimilarityThresholds(
+            plagiarism=data.get("plagiarism", DEFAULT_THRESHOLDS.plagiarism),
+            medium=data.get("medium", DEFAULT_THRESHOLDS.medium),
+            high=data.get("high", DEFAULT_THRESHOLDS.high),
+        )
+    except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+        logger.warning(
+            "Failed to load threshold config from %s: %s. Using defaults.",
+            config_path,
+            exc,
+        )
+        return DEFAULT_THRESHOLDS
 
 
 def normalize_score(score: Real) -> float:
@@ -340,3 +509,37 @@ def normalize_severity_label(label: str) -> str:
 def severity_rank(label: str) -> int:
     """Return a stable sort rank for a severity label."""
     return SEVERITY_RANK[normalize_severity_label(label)]
+
+
+# ============================================================================
+# OFFLINE MODE CONFIGURATION
+# ============================================================================
+
+
+def get_offline_mode_status() -> bool:
+    """Check if offline mode is enabled."""
+    import os
+
+    return os.getenv("OFFLINE_MODE", "false").lower() == "true"
+
+
+def get_offline_config() -> dict[str, Any]:
+    """Get offline mode configuration."""
+    import os
+
+    return {
+        "enabled": get_offline_mode_status(),
+        "cache_dir": os.getenv("OFFLINE_CACHE_DIR", ".cache/offline"),
+        "model_cache_dir": os.getenv("OFFLINE_MODEL_CACHE_DIR", ".cache/models"),
+        "max_cache_size_mb": int(os.getenv("OFFLINE_MAX_CACHE_SIZE_MB", "500")),
+        "preload_models": os.getenv("OFFLINE_PRELOAD_MODELS", "true").lower() == "true",
+        "disable_telemetry": os.getenv("OFFLINE_DISABLE_TELEMETRY", "true").lower()
+        == "true",
+    }
+
+
+def test_branding_config_path_exists():
+    """Test that BRANDING_CONFIG_PATH resolves to an existing file."""
+    config_path = config_module.BRANDING_CONFIG_PATH  # noqa: F821
+
+    assert os.path.isfile(config_path)

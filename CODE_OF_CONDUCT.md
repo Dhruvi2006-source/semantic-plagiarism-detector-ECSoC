@@ -45,7 +45,7 @@ or harmful.
 
 Community leaders have the right and responsibility to remove, edit, or reject
 comments, commits, code, wiki edits, issues, and other contributions that are
-not aligned to this Code of Conduct, and will communicate reasons for text
+not aligned to this Code of Conduct, and will communicate reasons for their
 decisions when appropriate.
 
 ## Scope
@@ -58,12 +58,30 @@ representative at an online or offline event.
 
 ## Enforcement
 
-Instances of abusive, harassing, or otherwise unacceptable behavior may be
-reported to the project maintainers. All complaints will be reviewed and
-investigated promptly and fairly.
+Instances of abusive, harassing, or otherwise unacceptable behavior may be reported to the project maintainers. All complaints will be reviewed and investigated promptly and fairly.
 
-All community leaders are obligated to respect the privacy and security of the
-reporter of any incident.
+### Reporting an Incident
+
+If you experience or witness unacceptable behavior, please report it to us via:
+
+* **Email:** [gkambli70@gmail.com](mailto:gkambli70@gmail.com)
+* **GitHub Direct Message:** Contact a maintainer privately
+
+*We currently accept reports via email or GitHub DM only. Regardless of channel, every report is handled with the same strict confidentiality outlined below.*
+
+When reporting, please include a description of the incident, relevant links, screenshots or logs, and the names (or usernames) of the people involved.
+
+### Confidentiality
+
+All reports are handled **exclusively by the project maintainers**. Details of an incident, including the reporter's identity, are shared only with the maintainers directly involved in the investigation. We will never disclose these details publicly without your explicit consent, except where strictly required by law or to protect the safety of others.
+
+All community leaders are obligated to respect the privacy and security of the reporter of any incident.
+
+### Response Timeline
+
+* **Acknowledgment:** Within **3 business days**
+* **Initial Review:** Within **10 business days** of acknowledgment
+* **Updates:** If a longer investigation is needed, we will provide progress updates at least once every 10 business days until the issue is resolved.
 
 ## Attribution
 
