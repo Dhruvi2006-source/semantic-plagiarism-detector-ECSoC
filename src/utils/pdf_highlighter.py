@@ -46,6 +46,26 @@ def highlight_pdf_matches(
             # Fallback: if no specific phrases provided, return unmodified PDF
             return pdf_bytes
 
+ perf/optimize-pdf-writing-3980
+    if not matching_phrases:
+        # Fallback: if no specific phrases provided, return unmodified PDF
+        return pdf_bytes
+
+    # Iterate through pages and highlight matched text
+    for page in doc:
+        for phrase in matching_phrases:
+            phrase_clean = phrase.strip()
+            # Ignore ultra-short tokens to avoid over-highlighting single words
+            if len(phrase_clean) > 8:
+                matches = page.search_for(phrase_clean)
+                for rect in matches:
+                    annot = page.add_highlight_annot(rect)
+                    annot.set_colors(stroke=(1, 1, 0))  # Bright Yellow
+                    annot.update()
+
+        # Return modified PDF bytes with compression and garbage collection
+        return doc.write(deflate=True, garbage=3)
+
         # Iterate through pages and highlight matched text
         for page in doc:
             for phrase in matching_phrases:
@@ -60,3 +80,4 @@ def highlight_pdf_matches(
 
         # Return modified PDF bytes
         return doc.write()
+ main
