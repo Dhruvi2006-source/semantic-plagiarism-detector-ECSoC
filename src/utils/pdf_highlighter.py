@@ -16,12 +16,25 @@ logger = logging.getLogger(__name__)
 __all__ = ["highlight_pdf_matches", "PDFEncryptedError"]
 
 
+def get_word_ngrams(text: str, n: int = 6) -> list[str]:
+    """Splits a block of text into overlapping n-gram phrases."""
+    words = text.split()
+    if len(words) <= n:
+        return [text] if text.strip() else []
+
+    ngrams = []
+    for i in range(len(words) - n + 1):
+        phrase = " ".join(words[i:i+n])
+        ngrams.append(phrase)
+    return ngrams
+
+
 def highlight_pdf_matches(
     pdf_bytes: bytes,
     matching_phrases: Optional[list[str]] = None,
     password: Optional[str] = None,
 ) -> bytes:
-    """Open a PDF in-memory, search for matching phrases, and apply yellow highlight annotations."""
+    """Open a PDF in-memory, search for matching phrases (as 6-word windows), and apply yellow highlights."""
     if not pdf_bytes:
         return b""
 
@@ -29,6 +42,12 @@ def highlight_pdf_matches(
     with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
         # Authenticate if encrypted
         if doc.is_encrypted:
+ feat/pdf-ngram-highlighter
+            if password:
+                doc.authenticate(password)
+            else:
+                return pdf_bytes
+
             authenticated = False
             if password:
                 authenticated = bool(doc.authenticate(password))
@@ -41,6 +60,7 @@ def highlight_pdf_matches(
                 raise PDFEncryptedError(
                     "PDF is encrypted and password was not provided or invalid."
                 )
+ main
 
         if not matching_phrases:
             # Fallback: if no specific phrases provided, return unmodified PDF
@@ -70,6 +90,24 @@ def highlight_pdf_matches(
         for page in doc:
             for phrase in matching_phrases:
                 phrase_clean = phrase.strip()
+ feat/pdf-ngram-highlighter
+                if not phrase_clean:
+                    continue
+
+                # Generate 6-word sliding windows to counter localized paraphrasing
+                sub_phrases = get_word_ngrams(phrase_clean, n=6)
+                for sub_phrase in sub_phrases:
+                    sub_clean = sub_phrase.strip()
+                    if len(sub_clean) > 8:
+                        matches = page.search_for(sub_clean)
+                        for rect in matches:
+                            annot = page.add_highlight_annot(rect)
+                            annot.set_colors(stroke=(1, 1, 0))  # Bright Yellow
+                            annot.update()
+
+        # Return modified PDF bytes with compression and garbage collection
+        return doc.write(deflate=True, garbage=3)
+
                 # Ignore ultra-short tokens to avoid over-highlighting single words
                 if len(phrase_clean) > 8:
                     matches = page.search_for(phrase_clean)
