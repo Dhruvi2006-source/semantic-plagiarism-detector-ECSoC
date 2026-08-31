@@ -7,15 +7,27 @@ def test_pdf_highlighters_context_manager():
     Verify that highlight_pdf_matches functions from both pdf_highlighter and pdf_report
     execute without leaks, utilizing context managers correctly.
     """
+ perf/optimize-pdf-writing-3980
     with open("tests/fixtures/clean.pdf", "rb") as f:
         pdf_bytes = f.read()
 
     # Test pdf_highlighter.highlight_pdf_matches with the new deflate and garbage flags
+
+    # 1. Read a valid sample PDF fixture
+    with open("tests/fixtures/clean.pdf", "rb") as f:
+        pdf_bytes = f.read()
+
+    # 2. Test pdf_highlighter.highlight_pdf_matches
+ main
     res_hl = highlight_hl(pdf_bytes, ["plagiarism", "semantic"])
     assert isinstance(res_hl, bytes)
     assert len(res_hl) > 0
 
+ perf/optimize-pdf-writing-3980
     # Test pdf_report.highlight_pdf_matches
+
+    # 3. Test pdf_report.highlight_pdf_matches
+ main
     res_rep = highlight_rep(pdf_bytes, ["plagiarism", "semantic"])
     assert isinstance(res_rep, bytes)
     assert len(res_rep) > 0

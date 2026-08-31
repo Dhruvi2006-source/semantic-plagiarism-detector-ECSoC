@@ -4,9 +4,16 @@ src/utils/pdf_highlighter.py
 Highlights overlapping phrases/sentences in a PDF file using PyMuPDF (fitz).
 """
 
+import logging
 from typing import List, Optional
 
 import fitz  # PyMuPDF
+
+from src.errors import PDFEncryptedError
+
+logger = logging.getLogger(__name__)
+
+__all__ = ["highlight_pdf_matches", "PDFEncryptedError"]
 
 
 def highlight_pdf_matches(
@@ -18,16 +25,28 @@ def highlight_pdf_matches(
     if not pdf_bytes:
         return b""
 
-    # Open PDF stream with PyMuPDF
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    # Open PDF stream with PyMuPDF context manager
+    with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
+        # Authenticate if encrypted
+        if doc.is_encrypted:
+            authenticated = False
+            if password:
+                authenticated = bool(doc.authenticate(password))
+            else:
+                # Try empty password in case PDF only has an owner password set
+                authenticated = bool(doc.authenticate(""))
 
-    # Authenticate if encrypted
-    if doc.is_encrypted:
-        if password:
-            doc.authenticate(password)
-        else:
+            if not authenticated:
+                logger.warning("PDF is encrypted and password was not provided or invalid.")
+                raise PDFEncryptedError(
+                    "PDF is encrypted and password was not provided or invalid."
+                )
+
+        if not matching_phrases:
+            # Fallback: if no specific phrases provided, return unmodified PDF
             return pdf_bytes
 
+ perf/optimize-pdf-writing-3980
     if not matching_phrases:
         # Fallback: if no specific phrases provided, return unmodified PDF
         return pdf_bytes
@@ -46,3 +65,19 @@ def highlight_pdf_matches(
 
         # Return modified PDF bytes with compression and garbage collection
         return doc.write(deflate=True, garbage=3)
+
+        # Iterate through pages and highlight matched text
+        for page in doc:
+            for phrase in matching_phrases:
+                phrase_clean = phrase.strip()
+                # Ignore ultra-short tokens to avoid over-highlighting single words
+                if len(phrase_clean) > 8:
+                    matches = page.search_for(phrase_clean)
+                    for rect in matches:
+                        annot = page.add_highlight_annot(rect)
+                        annot.set_colors(stroke=(1, 1, 0))  # Bright Yellow
+                        annot.update()
+
+        # Return modified PDF bytes
+        return doc.write()
+ main
