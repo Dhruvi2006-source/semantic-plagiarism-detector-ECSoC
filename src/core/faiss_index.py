@@ -6,14 +6,19 @@ Supports incremental index updates (Issue #3913).
 """
 
 import logging
+import os
 from typing import Any, Dict, List, Optional, Tuple
 
 # FAISS has no official type stubs; suppress Pylance false positives
 import faiss  # type: ignore
 import numpy as np
 
-from src.core.faiss_index_metadata import FAISSIndexMetadata
-from src.core.metrics import faiss_vectors_gauge
+from src.core.embedding_compatibility import (
+    ensure_compatible_metadata,
+    get_active_embedding_metadata,
+    get_embedding_model_metadata,
+)
+from src.core.faiss_index_metadata import FAISSIndexMetadatafrom src.core.metrics import faiss_vectors_gauge
 from src.core.text_chunking import ChunkString
 
 logger = logging.getLogger(__name__)
@@ -101,7 +106,12 @@ class FaissIndexManager:
         arr = np.ascontiguousarray(vectors, dtype=np.float32)
         if arr.ndim == 1:
             arr = arr.reshape(1, -1)
-        norms = np.linalg.norm(arr, axis=1, keepdims=True)
+
+        if arr.shape[1] != self.dimension:
+            raise ValueError(
+                "Embedding dimension is incompatible with this FAISS index: "
+                f"{arr.shape[1]} != {self.dimension}"
+            )        norms = np.linalg.norm(arr, axis=1, keepdims=True)
         norms = np.where(norms == 0, 1.0, norms)
         arr = arr / norms
         self.index.add(arr)
@@ -163,15 +173,20 @@ def build_index(
         (index, registry) — the FAISS index and a list mapping each vector
         position to its source ChunkRecord.
     """
-    dim = 384
     all_vectors: list[np.ndarray] = []
     registry: list[ChunkRecord] = []
-
+    dim: int | None = None
     for doc_name, emb in embeddings.items():
         chunks = chunked_docs.get(doc_name, [])
         if emb.ndim != 2 or emb.shape[0] == 0:
             continue
-        for i, (vec, chunk) in enumerate(zip(emb, chunks)):
+        if dim is None:
+            dim = int(emb.shape[1])
+        elif emb.shape[1] != dim:
+            raise ValueError(
+                "Embedding dimension mismatch across documents: "
+                f"{emb.shape[1]} != {dim}"
+            )        for i, (vec, chunk) in enumerate(zip(emb, chunks)):
             all_vectors.append(vec.astype("float32"))
             if isinstance(chunk, ChunkString):
                 registry.append(
@@ -181,9 +196,9 @@ def build_index(
                 registry.append(ChunkRecord(doc_name, i, chunk))
 
     if not all_vectors:
+        active_metadata = get_active_embedding_metadata()
         faiss_vectors_gauge.set(0)
-        return faiss.IndexFlatIP(dim), registry
-    matrix = np.vstack(all_vectors)
+        return faiss.IndexFlatIP(active_metadata.dimension), registry    matrix = np.vstack(all_vectors)
     norms = np.linalg.norm(matrix, axis=1, keepdims=True)
     norms = np.where(norms == 0, 1.0, norms)
     matrix = matrix / norms
@@ -261,10 +276,9 @@ def search_similar_chunks(
         List of (ChunkRecord, similarity_score) tuples, descending by score.
     """
     vec = query_embedding.astype("float32").reshape(1, -1)
-    norm = np.linalg.norm(vec, axis=1, keepdims=True)
-    norm = np.where(norm == 0, 1.0, norm)
-    vec = vec / norm
-
+    norm = np.linalg.norm(vec)
+    if norm > 0:
+        vec = vec / norm
     fetch_k = min(top_k * 3, index.ntotal) if exclude_doc else top_k
     fetch_k = max(fetch_k, 1)
 
@@ -330,6 +344,102 @@ def search_batch_vectors(
     return distances, indices
 
 
+def search_index(
+    query_vectors: np.ndarray | list[list[float]] | list[float],
+    index: Optional[faiss.Index] = None,
+    registry: Optional[list[ChunkRecord]] = None,
+    threshold: float = 0.0,
+    top_k: int = 10,
+    exclude_doc: Optional[str] = None,
+) -> list[dict[str, Any]]:
+    """Search the FAISS vector index with score threshold filtering (Issue #4036).
+
+    Queries candidate vectors and filters out any match where similarity score
+    is strictly less than the specified threshold.
+
+    Args:
+        query_vectors: 1D or 2D array or list of query embedding vectors.
+        index:         FAISS index instance.
+        registry:      Optional list of ChunkRecord objects corresponding to index IDs.
+        threshold:     Minimum similarity score (0.0 to 1.0) required to include a match.
+        top_k:         Maximum number of nearest matches to inspect per query vector.
+        exclude_doc:   Optional document name to exclude from search results.
+
+    Returns:
+        list[dict[str, Any]]: List of matches, each containing doc_name, chunk_index,
+            chunk_text, similarity_score, and metadata. All matches have similarity_score >= threshold.
+    """
+    if query_vectors is None:
+        return []
+
+    if isinstance(query_vectors, (list, tuple)):
+        query_mat = np.array(query_vectors, dtype=np.float32)
+    elif isinstance(query_vectors, np.ndarray):
+        query_mat = query_vectors.astype(np.float32)
+    else:
+        raise TypeError("query_vectors must be a numpy.ndarray or sequence of floats")
+
+    if query_mat.size == 0:
+        return []
+
+    if query_mat.ndim == 1:
+        query_mat = query_mat.reshape(1, -1)
+
+    if index is None or getattr(index, "ntotal", 0) == 0:
+        return []
+
+    # Unit-normalize queries for cosine similarity / inner product
+    norms = np.linalg.norm(query_mat, axis=1, keepdims=True)
+    norms = np.where(norms == 0, 1.0, norms)
+    query_mat = query_mat / norms
+
+    fetch_k = min(top_k * 3, index.ntotal) if exclude_doc else min(top_k, index.ntotal)
+    fetch_k = max(fetch_k, 1)
+
+    distances, indices = index.search(query_mat, fetch_k)  # type: ignore[call-arg]
+
+    matches: list[dict[str, Any]] = []
+    seen_keys: set[tuple[str, int]] = set()
+
+    for q_idx in range(query_mat.shape[0]):
+        q_scores = distances[q_idx]
+        q_indices = indices[q_idx]
+
+        for score, idx in zip(q_scores, q_indices):
+            if idx < 0:
+                continue
+            sim_score = float(round(float(score), 4))
+            if sim_score < threshold:
+                continue
+
+            record = registry[idx] if (registry and idx < len(registry)) else None
+            doc_name = record.doc_name if record else f"doc_{idx}"
+            chunk_text = record.chunk_text if record else ""
+            chunk_idx = record.chunk_index if record else int(idx)
+            metadata = record.metadata if record else {}
+
+            if exclude_doc and doc_name == exclude_doc:
+                continue
+
+            key = (doc_name, chunk_idx)
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+
+            matches.append(
+                {
+                    "doc_name": doc_name,
+                    "chunk_index": chunk_idx,
+                    "chunk_text": chunk_text,
+                    "similarity_score": sim_score,
+                    "metadata": metadata,
+                }
+            )
+
+    matches.sort(key=lambda x: x["similarity_score"], reverse=True)
+    return matches[:top_k]
+
+
 def find_plagiarised_chunks(
     embeddings: dict[str, np.ndarray],
     chunked_docs: dict[str, list[str]],
@@ -374,18 +484,16 @@ def find_plagiarised_chunks(
                 if pair_key in seen_pairs:
                     continue
                 seen_pairs.add(pair_key)
+                if chunk_idx < len(chunks):
+                    c_item = chunks[chunk_idx]
+                    src_text = getattr(c_item, "text", str(c_item))
+                else:
+                    src_text = ""
+
                 matches.append(
                     {
                         "source_doc": doc_name,
-                        "source_chunk_text": (
-                            (
-                                chunks[chunk_idx].text
-                                if hasattr(chunks[chunk_idx], "text")
-                                else str(chunks[chunk_idx])
-                            )
-                            if chunk_idx < len(chunks)
-                            else ""
-                        ),
+                        "source_chunk_text": src_text,
                         "match_doc": record.doc_name,
                         "match_chunk_text": record.chunk_text,
                         "similarity": round(score, 4),
@@ -426,6 +534,10 @@ def add_to_index(
         chunks = chunked_docs.get(doc_name, [])
         if emb.ndim != 2 or emb.shape[0] == 0:
             continue
+        if emb.shape[1] != index.d:
+            raise ValueError(
+                f"Embedding dimension mismatch: {emb.shape[1]} != {index.d}"
+            )
         for i, (vec, chunk) in enumerate(zip(emb, chunks)):
             new_vectors.append(vec.astype("float32"))
             if isinstance(chunk, ChunkString):
@@ -682,8 +794,12 @@ def remove_document_from_index(
 
 
 def save_index(index: faiss.Index, path: str) -> None:
-    """Persist a FAISS index to disk."""
+    """Persist a FAISS index to disk with restrictive file permissions (0o600)."""
     faiss.write_index(index, path)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
     logger.info(f"[faiss_index] Index saved → {path}  ({index.ntotal} vectors)")
 
 
@@ -708,10 +824,19 @@ def build_index_from_matrix(
     so that ``add_to_index()`` and ``remove_vectors_by_doc()`` can be used later
     without a full rebuild.
     """
-    dim = 384
-    if matrix.size == 0 or matrix.shape[0] == 0:
-        return faiss.IndexFlatIP(dim)
+    active_metadata = get_active_embedding_metadata()
 
+    if matrix.size == 0 or matrix.shape[0] == 0:
+        return faiss.IndexFlatIP(active_metadata.dimension)
+
+    dim = int(matrix.shape[1])
+
+    if dim != active_metadata.dimension:
+        raise ValueError(
+            "Embedding dimension is incompatible with the active model: "
+            f"{dim} != {active_metadata.dimension}. "
+            "Run the embedding migration before rebuilding FAISS."
+        )
     n_vectors = matrix.shape[0]
     mat = matrix.astype("float32")
     norms = np.linalg.norm(mat, axis=1, keepdims=True)
@@ -798,29 +923,99 @@ def load_or_rebuild_index(filepath: str) -> tuple[faiss.Index, list[ChunkRecord]
 
     matrix = get_all_embeddings()
     registry = get_chunk_registry()
+    active_metadata = get_active_embedding_metadata()
 
-    n_matrix = matrix.shape[0] if (matrix is not None and matrix.size > 0) else 0
+    n_matrix = (
+        matrix.shape[0]
+        if (matrix is not None and matrix.size > 0)
+        else 0
+    )
     n_registry = len(registry)
 
     if n_matrix != n_registry:
         from src.errors import FAISS_EMB_REGISTRY_MISMATCH
 
         raise ValueError(
-            FAISS_EMB_REGISTRY_MISMATCH.format(emb_count=n_matrix, reg_count=n_registry)
+            FAISS_EMB_REGISTRY_MISMATCH.format(
+                emb_count=n_matrix,
+                reg_count=n_registry,
+            )
         )
+
+    if matrix is not None and matrix.size > 0:
+        if matrix.shape[1] != active_metadata.dimension:
+            raise ValueError(
+                "Stored embeddings are incompatible with the active model. "
+                f"Stored dimension={matrix.shape[1]}, "
+                f"active dimension={active_metadata.dimension}. "
+                "Run the embedding migration before rebuilding the index."
+            )
+
+    metadata_manager = FAISSIndexMetadata()
 
     if os.path.exists(filepath):
         try:
             index = load_index(filepath)
-            if validate_index(index, n_matrix, 384):
+
+            stored_index_metadata = metadata_manager.metadata
+
+            if (
+                stored_index_metadata is not None
+                and stored_index_metadata.embedding_model_identifier
+            ):
+                index_metadata = get_embedding_model_metadata(
+                    stored_index_metadata.embedding_dimension or index.d,
+                )
+
+                index_metadata = type(active_metadata)(
+                    model_identifier=(
+                        stored_index_metadata.embedding_model_identifier
+                    ),
+                    model_version=(
+                        stored_index_metadata.embedding_model_version
+                        or "unknown"
+                    ),
+                    dimension=(
+                        stored_index_metadata.embedding_dimension
+                        or index.d
+                    ),
+                    normalization_strategy=(
+                        stored_index_metadata.embedding_normalization_strategy
+                        or "unknown"
+                    ),
+                    generated_at=active_metadata.generated_at,
+                    vector_schema_version=(
+                        stored_index_metadata.vector_schema_version or 0
+                    ),
+                )
+
+                ensure_compatible_metadata(
+                    active_metadata,
+                    index_metadata,
+                )
+
+            if validate_index(
+                index,
+                n_matrix,
+                active_metadata.dimension,
+            ):
                 return index, registry, False
+        except ValueError:
+            raise
         except Exception:
             pass
 
-    index = build_index_from_matrix(matrix)
+    index = build_index_from_matrix(
+        matrix,
+        use_id_map=True,
+    )
+
+    metadata_manager.set_embedding_metadata(active_metadata)
+    metadata_manager.metadata.total_vectors = index.ntotal
+    metadata_manager.save()
+
     save_index(index, filepath)
     return index, registry, True
-
 
 # ── FAISS Index Optimization Helper (Issue #1354) ───────────────────────────
 
@@ -1131,3 +1326,78 @@ def get_index_consistency_status(
             )
 
     return status
+
+
+def rebuild_index_from_db(
+    db_path: Optional[Any] = None,
+    index_path: Optional[Any] = None,
+) -> int:
+    """Reconstruct the FAISS index file from scratch using embeddings stored in SQLite chunks table.
+
+    Administrative helper that queries all vector embeddings from the SQLite chunks table,
+    builds a clean FAISS vector index, saves it to disk, and returns the vector count.
+
+    Args:
+        db_path: Optional path to SQLite corpus database. Defaults to configured corpus DB if None.
+        index_path: Optional path to save FAISS index file. Defaults to FAISS_INDEX_PATH if None.
+
+    Returns:
+        int: Total vector count added to the rebuilt FAISS index.
+    """
+    import os
+    import sqlite3
+    from src.core.app_config import FAISS_INDEX_PATH
+    from src.core.concurrency import faiss_write_lock
+
+    if db_path is not None:
+        target_db = str(db_path)
+    else:
+        from src.core.app_config import CORPUS_DB_PATH
+
+        target_db = str(CORPUS_DB_PATH)
+
+    if index_path is not None:
+        target_index = str(index_path)
+    else:
+        target_index = str(FAISS_INDEX_PATH)
+
+    embeddings: list[np.ndarray] = []
+    if os.path.exists(target_db):
+        try:
+            with sqlite3.connect(target_db) as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT embedding FROM chunks ORDER BY vector_id ASC")
+                rows = cursor.fetchall()
+                for r in rows:
+                    if r and r[0] is not None:
+                        arr = np.frombuffer(r[0], dtype=np.float32)
+                        if arr.size > 0:
+                            embeddings.append(arr)
+        except sqlite3.OperationalError as exc:
+            logger.warning(
+                f"[faiss_index] Could not query chunks table from {target_db}: {exc}"
+            )
+
+    if embeddings:
+        matrix = np.vstack(embeddings)
+    else:
+        matrix = np.empty((0, 384), dtype=np.float32)
+
+    new_index = build_index_from_matrix(matrix)
+
+    out_dir = os.path.dirname(os.path.abspath(target_index))
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+
+    with faiss_write_lock(f"{target_index}.lock"):
+        save_index(new_index, target_index)
+
+    total_added = int(getattr(new_index, "ntotal", 0) or 0)
+    logger.info(
+        f"[faiss_index] Successfully rebuilt index from DB '{target_db}' -> '{target_index}' ({total_added} vectors)."
+    )
+    return total_added
+
+
+rebuild_index_from_database = rebuild_index_from_db
+

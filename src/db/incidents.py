@@ -393,7 +393,8 @@ def sync_flagged_incidents(
                     ON CONFLICT(incident_id) DO UPDATE SET
                         similarity_score = excluded.similarity_score,
                         severity_rank = excluded.severity_rank,
-                        last_seen = excluded.last_seen
+                        last_seen = excluded.last_seen,
+                        times_flagged = plagiarism_incidents.times_flagged + 1
                     """,
                     bulk_records,
                 )
@@ -408,7 +409,7 @@ def sync_flagged_incidents(
                 SELECT pi.incident_id, pi.document_a, pi.document_b,
                        pi.similarity_score, pi.severity_rank,
                        pi.review_status, pi.date_flagged, pi.last_seen,
-                       pi.threshold_at_time_of_flag
+                       pi.threshold_at_time_of_flag, pi.times_flagged
                 FROM plagiarism_incidents pi
                 LEFT JOIN documents da ON pi.document_a = da.filename
                 LEFT JOIN documents db ON pi.document_b = db.filename
@@ -429,6 +430,7 @@ def sync_flagged_incidents(
                     date_flagged=row["date_flagged"],
                     last_seen=row["last_seen"],
                     threshold_at_time_of_flag=row["threshold_at_time_of_flag"],
+                    times_flagged=row["times_flagged"]
                 )
                 for row in rows
             ]
@@ -491,6 +493,33 @@ def get_total_incidents_count(
             """
         ).fetchone()
     return int(row[0]) if row is not None else 0
+
+
+def get_incident_statistics(
+    db_path: str | Path = DEFAULT_DB_PATH,
+) -> dict[str, Any]:
+    """Return a summary of plagiarism incident statistics.
+    Returns:
+        A dictionary containing:
+        - 'total': Total number of visible incidents.
+        - 'severity_distribution': A mapping of severity levels to counts.
+        - 'daily_counts': A list of daily incident counts.
+    """
+    total = get_total_incidents_count(db_path)
+    
+    # Get distribution by severity
+    severity_distribution = {}
+    for level in ["High", "Medium", "Low"]:
+        severity_distribution[level] = len(get_incidents_by_severity(level, db_path))
+        
+    # Get daily counts
+    daily_counts = get_incidents_count_by_date(db_path)
+    
+    return {
+        "total": total,
+        "severity_distribution": severity_distribution,
+        "daily_counts": daily_counts,
+    }
 
 
 def get_incident_by_id(
