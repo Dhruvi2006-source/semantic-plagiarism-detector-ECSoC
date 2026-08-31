@@ -44,5 +44,5 @@ def highlight_pdf_matches(
                     annot.set_colors(stroke=(1, 1, 0))  # Bright Yellow
                     annot.update()
 
-    # Return modified PDF bytes
-    return doc.write()
+        # Return modified PDF bytes with compression and garbage collection
+        return doc.write(deflate=True, garbage=3)
