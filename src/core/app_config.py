@@ -56,6 +56,17 @@ if APP_ENV == "production":
         raise SystemExit("Fatal: Default secrets detected in production environment.")
 
 
+# ─── Logging level configuration (issue #3745) ─────────────────────────────
+# Configured via the ``LOG_LEVEL`` environment variable (e.g. DEBUG, INFO,
+# WARNING, ERROR), defaulting to "INFO". A ``getattr`` fallback to
+# ``logging.INFO`` is used (rather than raising) so a malformed value such
+# as ``LOG_LEVEL=GARBAGE`` degrades to the default instead of crashing the
+# app at import time -- matching the defensive-default pattern already used
+# by ``_get_env_int`` / ``_get_env_bool`` / ``_get_env_bool_alt`` above.
+LOG_LEVEL: Final[str] = os.getenv("LOG_LEVEL", "INFO").strip().upper()
+logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
+
+
 # ─── Application display config (pre-existing) ─────────────────────────────
 DEFAULT_APP_TITLE: Final[str] = "Semantic Plagiarism Detection System"
 DEFAULT_PDF_FOOTER_TEXT: Final[str] = ""
